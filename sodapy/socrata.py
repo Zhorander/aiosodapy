@@ -1,10 +1,11 @@
+import aiohttp
 import csv
 from io import StringIO, IOBase
 import json
 import logging
 import os
 import re
-import requests
+from typing import List, Set
 
 from sodapy.constants import DATASETS_PATH
 import sodapy.utils as utils
@@ -27,7 +28,6 @@ class Socrata:
         username=None,
         password=None,
         access_token=None,
-        session_adapter=None,
         timeout=10,
     ):
         """
@@ -58,7 +58,7 @@ class Socrata:
         self.domain = domain
 
         # set up the session with proper authentication crendentials
-        self.session = requests.Session()
+        self.session = aiohttp.ClientSession()
         if not app_token:
             logging.warning(
                 "Requests made without an app_token will be"
@@ -77,32 +77,29 @@ class Socrata:
                 {"Authorization": "OAuth {}".format(access_token)}
             )
 
-        if session_adapter:
-            self.session.mount(session_adapter["prefix"], session_adapter["adapter"])
-            self.uri_prefix = session_adapter["prefix"]
-        else:
-            self.uri_prefix = "https://"
+        self.uri_prefix = "https://"
 
         if not isinstance(timeout, (int, float)):
             raise TypeError("Timeout must be numeric.")
         self.timeout = timeout
 
-    def __enter__(self):
+    async def __aenter__(self):
         """
         This runs as the with block is set up.
         """
         return self
 
-    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
+    async def __aexit__(self, exc_type=None, exc_value=None, traceback=None):
         """
         This runs at the end of a with block. It simply closes the client.
 
         Exceptions are propagated forward in the program as usual, and
             are not handled here.
         """
-        self.close()
+        await self.close()
 
-    def datasets(self, limit=0, offset=0, order=None, **kwargs):
+    async def datasets(self, limit=0, offset=0, order=None, **kwargs
+                       ) -> List[dict]:
         """
         Returns the list of datasets associated with a particular domain.
         WARNING: Large limits (>1000) will return megabytes of data,
@@ -191,7 +188,7 @@ class Socrata:
                 "derived",
             ]
         )
-        all_filters = filter_multiple.union(filter_single)
+        all_filters: Set[str] = filter_multiple.union(filter_single)
         for key in kwargs:
             if key not in all_filters:
                 raise TypeError("Unexpected keyword argument %s" % key)
@@ -211,9 +208,15 @@ class Socrata:
         if order:
             params.append(("order", order))
 
-        results = self._perform_request(
+        results = await self._perform_request(
             "get", DATASETS_PATH, params=params + [("offset", offset)]
         )
+
+        if not isinstance(results, dict):
+            raise TypeError(
+                f"Error getting datasets, expected list, got {type(results)}"
+            )
+
         num_results = results["resultSetSize"]
         # no more results to fetch, or limit reached
         if (
@@ -235,14 +238,14 @@ class Socrata:
         all_results = results["results"]
         while len(all_results) != num_results:
             offset += len(results["results"])
-            results = self._perform_request(
+            results = await self._perform_request(
                 "get", DATASETS_PATH, params=params + [("offset", offset)]
             )
             all_results.extend(results["results"])
 
         return all_results
 
-    def create(self, name, **kwargs):
+    async def create(self, name, **kwargs):
         """
         Create a dataset, including the field types. Optionally, specify args such as:
             description : description of the dataset
@@ -267,9 +270,9 @@ class Socrata:
         payload.update(kwargs)
         payload = utils.clear_empty_values(payload)
 
-        return self._perform_update("post", resource, payload)
+        return await self._perform_update("post", resource, payload)
 
-    def set_permission(
+    async def set_permission(
         self, dataset_identifier, permission="private", content_type="json"
     ):
         """
@@ -286,18 +289,18 @@ class Socrata:
             "value": "public.read" if permission == "public" else permission,
         }
 
-        return self._perform_request("put", resource, params=params)
+        return await self._perform_request("put", resource, params=params)
 
-    def get_metadata(self, dataset_identifier, content_type="json"):
+    async def get_metadata(self, dataset_identifier, content_type="json"):
         """
         Retrieve the metadata for a particular dataset.
         """
         resource = utils.format_old_api_request(
             dataid=dataset_identifier, content_type=content_type
         )
-        return self._perform_request("get", resource)
+        return await self._perform_request("get", resource)
 
-    def update_metadata(self, dataset_identifier, update_fields, content_type="json"):
+    async def update_metadata(self, dataset_identifier, update_fields, content_type="json"):
         """
         Update the metadata for a particular dataset.
             update_fields is a dictionary containing [metadata key:new value] pairs.
@@ -308,16 +311,16 @@ class Socrata:
         resource = utils.format_old_api_request(
             dataid=dataset_identifier, content_type=content_type
         )
-        return self._perform_update("put", resource, update_fields)
+        return await self._perform_update("put", resource, update_fields)
 
-    def download_attachments(
+    async def download_attachments(
         self, dataset_identifier, content_type="json", download_dir="~/sodapy_downloads"
     ):
         """
         Download all of the attachments associated with a dataset. Return the paths of downloaded
         files.
         """
-        metadata = self.get_metadata(dataset_identifier, content_type=content_type)
+        metadata = await self.get_metadata(dataset_identifier, content_type=content_type)
         files = []
         attachments = metadata["metadata"].get("attachments")
         if not attachments:
@@ -345,7 +348,7 @@ class Socrata:
                 resource = "{}/{}?download=true".format(base, assetid)
 
             uri = "{}{}{}".format(self.uri_prefix, self.domain, resource)
-            utils.download_file(uri, file_path)
+            await utils.download_file(uri, file_path)
             files.append(file_path)
 
         logging.info(
@@ -353,7 +356,7 @@ class Socrata:
         )
         return files
 
-    def publish(self, dataset_identifier, content_type="json"):
+    async def publish(self, dataset_identifier, content_type="json"):
         """
         The create() method creates a dataset in a "working copy" state.
         This method publishes it.
@@ -361,9 +364,9 @@ class Socrata:
         base = utils.format_old_api_request(dataid=dataset_identifier)
         resource = "{}/publication.{}".format(base, content_type)
 
-        return self._perform_request("post", resource)
+        return await self._perform_request("post", resource)
 
-    def get(self, dataset_identifier, content_type="json", **kwargs):
+    async def get(self, dataset_identifier, content_type="json", **kwargs):
         """
         Read data from the requested resource. Options for content_type are json,
         csv, and xml. Optionally, specify a keyword arg to filter results:
@@ -409,12 +412,12 @@ class Socrata:
         params.update(kwargs)
         params = utils.clear_empty_values(params)
 
-        response = self._perform_request(
+        response = await self._perform_request(
             "get", resource, headers=headers, params=params
         )
         return response
 
-    def get_all(self, *args, **kwargs):
+    async def get_all(self, *args, **kwargs):
         """
         Read data from the requested resource, paginating over all results.
         Accepts the same arguments as get(). Returns a generator.
@@ -426,7 +429,7 @@ class Socrata:
         limit = params.get("limit", self.DEFAULT_LIMIT)
 
         while True:
-            response = self.get(*args, **params)
+            response = await self.get(*args, **params)
             for item in response:
                 yield item
 
@@ -434,7 +437,7 @@ class Socrata:
                 return
             params["offset"] += limit
 
-    def upsert(self, dataset_identifier, payload, content_type="json"):
+    async def upsert(self, dataset_identifier, payload, content_type="json"):
         """
         Insert, update or delete data to/from an existing dataset. Currently
         supports json and csv file objects. See here for the upsert
@@ -445,9 +448,9 @@ class Socrata:
             dataid=dataset_identifier, content_type=content_type
         )
 
-        return self._perform_update("post", resource, payload)
+        return await self._perform_update("post", resource, payload)
 
-    def replace(self, dataset_identifier, payload, content_type="json"):
+    async def replace(self, dataset_identifier, payload, content_type="json"):
         """
         Same logic as upsert, but overwrites existing data with the payload
         using PUT instead of POST.
@@ -456,9 +459,9 @@ class Socrata:
             dataid=dataset_identifier, content_type=content_type
         )
 
-        return self._perform_update("put", resource, payload)
+        return await self._perform_update("put", resource, payload)
 
-    def create_non_data_file(self, params, file_data):
+    async def create_non_data_file(self, params, file_data):
         """
         Creates a new file-based dataset with the name provided in the files
         tuple.  A valid file input would be:
@@ -471,9 +474,9 @@ class Socrata:
         if not params.get("method", None):
             params["method"] = "blob"
 
-        return self._perform_request("post", api_prefix, params=params, files=file_data)
+        return await self._perform_request("post", api_prefix, params=params, files=file_data)
 
-    def replace_non_data_file(self, dataset_identifier, params, file_data):
+    async def replace_non_data_file(self, dataset_identifier, params, file_data):
         """
         Same as create_non_data_file, but replaces a file that already exists in a
         file-based dataset.
@@ -490,20 +493,20 @@ class Socrata:
 
         params["id"] = dataset_identifier
 
-        return self._perform_request("post", resource, params=params, files=file_data)
+        return await self._perform_request("post", resource, params=params, files=file_data)
 
-    def _perform_update(self, method, resource, payload):
+    async def _perform_update(self, method, resource, payload):
         """
         Execute the update task.
         """
 
         if isinstance(payload, (dict, list)):
-            response = self._perform_request(method, resource, data=json.dumps(payload))
+            response = await self._perform_request(method, resource, data=json.dumps(payload))
         elif isinstance(payload, IOBase):
             headers = {
                 "content-type": "text/csv",
             }
-            response = self._perform_request(
+            response = await self._perform_request(
                 method, resource, data=payload, headers=headers
             )
         else:
@@ -514,7 +517,7 @@ class Socrata:
 
         return response
 
-    def delete(self, dataset_identifier, row_id=None, content_type="json"):
+    async def delete(self, dataset_identifier, row_id=None, content_type="json"):
         """
         Delete the entire dataset, e.g.
             client.delete("nimj-3ivp")
@@ -530,54 +533,63 @@ class Socrata:
                 dataid=dataset_identifier, content_type=content_type
             )
 
-        return self._perform_request("delete", resource)
+        return await self._perform_request("delete", resource)
 
-    def _perform_request(self, request_type, resource, **kwargs):
+    async def _perform_request(self, request_type, resource, **kwargs
+                               ) -> list | aiohttp.ClientResponse | bytes | str:
         """
         Utility method that performs all requests.
         """
-        request_type_methods = set(["get", "post", "put", "delete"])
+        request_type_methods: Set[str] = set(["get", "post", "put", "delete"])
         if request_type not in request_type_methods:
             raise Exception(
                 "Unknown request type. Supported request types are"
                 ": {}".format(", ".join(request_type_methods))
             )
 
-        uri = "{}{}{}".format(self.uri_prefix, self.domain, resource)
+        uri: str = "{}{}{}".format(self.uri_prefix, self.domain, resource)
 
         # set a timeout, just to be safe
         kwargs["timeout"] = self.timeout
 
-        response = getattr(self.session, request_type)(uri, **kwargs)
+        response: aiohttp.ClientResponse = await (
+            getattr(self.session, request_type)(uri, **kwargs)
+        )
 
         # handle errors
-        if response.status_code not in (200, 202):
-            utils.raise_for_status(response)
+        if response.status not in (200, 202):
+            await utils.raise_for_status(response)
 
         # when responses have no content body (ie. delete, set_permission),
         # simply return the whole response
-        if not response.text:
+        if not await response.text():
             return response
 
         # for other request types, return most useful data
-        content_type = response.headers.get("content-type").strip().lower()
+        content_type: str = (
+            response
+            .headers
+            .get("content-type")
+            .strip()
+            .lower()
+        )
         if re.match(r"application\/(vnd\.geo\+)?json", content_type):
-            return response.json()
+            return await response.json()
         if re.match(r"text\/csv", content_type):
-            csv_stream = StringIO(response.text)
+            csv_stream = StringIO(await response.text())
             return list(csv.reader(csv_stream))
         if re.match(r"application\/rdf\+xml", content_type):
-            return response.content
+            return await response.content.read()
         if re.match(r"text\/plain", content_type):
             try:
-                return json.loads(response.text)
+                return json.loads(await response.text())
             except ValueError:
-                return response.text
+                return await response.text()
 
         raise Exception("Unknown response format: {}".format(content_type))
 
-    def close(self):
+    async def close(self) -> None:
         """
         Close the session.
         """
-        self.session.close()
+        await self.session.close()

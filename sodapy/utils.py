@@ -1,33 +1,38 @@
-import requests
+import aiohttp
+import aiofiles
 
 from .constants import DEFAULT_API_PATH, OLD_API_PATH
 
 
 # Utility methods
-def raise_for_status(response):
+async def raise_for_status(response: aiohttp.ClientResponse):
     """
     Custom raise_for_status with more appropriate error message.
     """
     http_error_msg = ""
 
-    if 400 <= response.status_code < 500:
+    if 400 <= response.status < 500:
         http_error_msg = "{} Client Error: {}".format(
-            response.status_code, response.reason
+            response.status, response.reason
         )
 
-    elif 500 <= response.status_code < 600:
+    elif 500 <= response.status < 600:
         http_error_msg = "{} Server Error: {}".format(
-            response.status_code, response.reason
+            response.status, response.reason
         )
 
     if http_error_msg:
         try:
-            more_info = response.json().get("message")
+            more_info: str | None = (await response.json()).get("message")
         except ValueError:
             more_info = None
-        if more_info and more_info.lower() != response.reason.lower():
+        if response.reason and more_info and more_info.lower() != response.reason.lower():
             http_error_msg += ".\n\t{}".format(more_info)
-        raise requests.exceptions.HTTPError(http_error_msg, response=response)
+        raise aiohttp.ClientResponseError(
+            request_info=response.request_info,
+            history=(response,),
+            message=http_error_msg
+        )
 
 
 def clear_empty_values(args):
@@ -82,13 +87,12 @@ def authentication_validation(username, password, access_token):
         )
 
 
-def download_file(url, local_filename):
+async def download_file(url: str, local_filename: str) -> None:
     """
     Utility function that downloads a chunked response from the specified url to a local path.
     This method is suitable for larger downloads.
     """
-    response = requests.get(url, stream=True)
-    with open(local_filename, "wb") as outfile:
-        for chunk in response.iter_content(chunk_size=1024):
-            if chunk:  # filter out keep-alive new chunks
-                outfile.write(chunk)
+    async with aiohttp.ClientSession() as session:
+        response: aiohttp.ClientResponse = await session.get(url)
+        async with aiofiles.open(local_filename, "wb") as outfile:
+            await outfile.write(await response.read())
